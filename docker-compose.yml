@@ -1,0 +1,46 @@
+services:
+  web1:
+    image: nginx:alpine
+    container_name: web1
+    volumes:
+      - ./web1:/usr/share/nginx/html:ro
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+  web2:
+    image: nginx:alpine
+    container_name: web2
+    volumes:
+      - ./web2:/usr/share/nginx/html:ro
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+  web3:
+    image: nginx:alpine
+    container_name: web3
+    volumes:
+      - ./web3:/usr/share/nginx/html:ro
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-lb
+    ports:
+      - "${LB_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - web1
+      - web2
+      - web3
+    networks:
+      - lb-network
+    restart: unless-stopped
+
+networks:
+  lb-network:
+    driver: bridge
