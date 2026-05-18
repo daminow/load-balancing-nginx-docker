@@ -1,46 +1,166 @@
+x-api-base: &api-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: ${API_IMAGE:-load-balancing-app:local}
+  env_file:
+    - .env
+  environment:
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  networks:
+    - lb-network
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 384M
+
 services:
-  web1:
-    image: nginx:alpine
-    container_name: web1
+  postgres:
+    image: postgres:16.4-alpine
+    container_name: lb-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - ./web1:/usr/share/nginx/html:ro
+      - postgres_data:/var/lib/postgresql/data
     networks:
       - lb-network
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
-  web2:
-    image: nginx:alpine
-    container_name: web2
-    volumes:
-      - ./web2:/usr/share/nginx/html:ro
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${API_IMAGE:-load-balancing-app:local}
+    container_name: lb-migrate
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      INSTANCE_ID: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/usr/bin/tini", "--"]
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
     networks:
       - lb-network
-    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
-  web3:
-    image: nginx:alpine
-    container_name: web3
-    volumes:
-      - ./web3:/usr/share/nginx/html:ro
-    networks:
-      - lb-network
-    restart: unless-stopped
+  api1:
+    <<: *api-base
+    container_name: lb-api1
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      INSTANCE_ID: api1
+
+  api2:
+    <<: *api-base
+    container_name: lb-api2
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      INSTANCE_ID: api2
+
+  api3:
+    <<: *api-base
+    container_name: lb-api3
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      INSTANCE_ID: api3
 
   nginx:
-    image: nginx:alpine
-    container_name: nginx-lb
+    image: nginx:1.27-alpine
+    container_name: lb-nginx
     ports:
       - "${LB_PORT:-8080}:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_cache:/var/cache/nginx
+      - nginx_run:/var/run
     depends_on:
-      - web1
-      - web2
-      - web3
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+      api3:
+        condition: service_healthy
     networks:
       - lb-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/lb-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - NET_BIND_SERVICE
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
 
 networks:
   lb-network:
+    name: lb-network
     driver: bridge
+
+volumes:
+  postgres_data:
+    name: lb_postgres_data
+  nginx_cache:
+    name: lb_nginx_cache
+  nginx_run:
+    name: lb_nginx_run

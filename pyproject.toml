@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "load-balancing-app"
+version = "1.0.0"
+description = "Multi-service FastAPI + PostgreSQL behind an Nginx reverse proxy with load balancing."
+requires-python = ">=3.12,<3.13"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Timur Daminov" },
+    { name = "Mikail Khamkhoev" },
+    { name = "Almir Avkhadiev" },
+    { name = "Anton Bugaev" },
+]
+dependencies = [
+    "fastapi==0.128.0",
+    "uvicorn[standard]==0.34.0",
+    "sqlalchemy[asyncio]==2.0.36",
+    "asyncpg==0.30.0",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.0",
+    "alembic==1.14.0",
+    "tenacity==9.0.0",
+    "structlog==24.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.25.0",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.1",
+    "ruff==0.8.4",
+    "mypy==1.13.0",
+    "types-passlib==1.7.7.20240819",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["tests*", "alembic*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "B",
+    "UP",
+    "S",
+    "C4",
+    "SIM",
+    "RUF",
+    "ASYNC",
+]
+ignore = [
+    "S101",
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]
+"alembic/env.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+exclude = ["alembic/versions", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra -q --strict-markers"
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:passlib.*",
+]

@@ -1,347 +1,305 @@
-# Project Report: Load Balancing with Nginx and Docker
+# Project Report — Automated Deployment of a Multi-Service Web Application with CI/CD
 
-**Repository:** https://github.com/daminow/load-balancing-nginx-docker
-**Course:** System and Network Administration (SNA), Innopolis University
-**Author:** Timur Daminov
+| | |
+|---|---|
+| Course | System and Network Administration (S25), Innopolis University |
+| Team | Timur Daminov, Mikail Khamkhoev, Almir Avkhadiev, Anton Bugaev |
+| Approved topic | Automated Deployment of a Multi-Service Web Application with CI/CD |
+| Stack | Docker, Docker Compose, Nginx, FastAPI, PostgreSQL, GitHub Actions |
+| Source | `load-balancing-project/` in the team repository |
 
 ---
 
-## I. Goal / Tasks of the Project
+## I. Goal and tasks
 
 ### Goal
-Build a working reverse-proxy + load-balancing setup that distributes HTTP traffic across multiple backend servers, demonstrates round-robin scheduling, and survives the failure of any single backend without dropping client requests.
 
-### Concrete tasks
-1. Containerize three independent backend web servers, each serving a uniquely identifiable page.
-2. Put an Nginx reverse proxy in front of them with round-robin upstream selection.
-3. Use an isolated Docker bridge network so backends are reachable **only** through the proxy.
-4. Implement automatic failover (`proxy_next_upstream`, `max_fails`, `fail_timeout`).
-5. Expose a `/health` endpoint on the load balancer.
-6. Make the public port configurable through `.env`.
-7. Document and verify the behavior (round-robin, failover, recovery) reproducibly.
+Deliver a self-contained deployment that covers every item of the approved scope: a multi-service web application (FastAPI + PostgreSQL), Nginx as a reverse proxy balancing several application replicas, persistent storage on a Docker named volume, configuration kept out of git, and a GitHub Actions pipeline that builds, tests and ships the container image.
 
-### Team responsibilities
-This is a solo project — all roles below were performed by the author:
+### Tasks
 
-| Role | Responsibility |
-|---|---|
-| Infrastructure / DevOps | `docker-compose.yml`, network design, `.env` parameterization |
-| Backend / Configuration | `nginx.conf` upstream, headers, failover policy, health check |
-| Frontend (static) | Three distinct `index.html` pages for visual round-robin verification |
-| QA / Documentation | `README.md`, `validate.sh`, this report |
+1. Write a FastAPI service on Python 3.12 that talks to PostgreSQL over async SQLAlchemy 2.0 with `asyncpg`. Expose a representative CRUD surface on `/api/v1/items`, plus a liveness probe and a readiness probe that issues a real database round-trip.
+2. Package the service in a multi-stage `Dockerfile`. Run as a non-root user, drop all Linux capabilities, mark the root filesystem read-only at runtime, use `tini` as PID 1.
+3. Compose the stack with Docker Compose: PostgreSQL, three identical API replicas, a one-shot Alembic migration container, and an Nginx reverse proxy. Order startup with healthchecks and `condition: service_completed_successfully`.
+4. Use a Docker named volume (`lb_postgres_data`) for PostgreSQL data. Keep all configuration in `.env`, commit only the `.env.example` template, gitignore the real `.env`.
+5. Configure Nginx as a real reverse proxy: `least_conn` upstream with `keepalive`, passive health checks, `proxy_next_upstream` for transparent failover, rate limiting, security response headers, JSON access logs.
+6. Build a GitHub Actions pipeline that lints, type-checks, runs `pytest` against a real PostgreSQL service container, runs a Compose smoke build, and pushes a multi-arch image to GHCR with provenance and SBOM attestations. Add a separate workflow for gitleaks, Trivy (filesystem + image) and hadolint.
+7. Demonstrate the running balancer and its failover behaviour from outside the cluster using `curl`.
 
----
+### Division of responsibilities
 
-## II. Execution plan / Methodology
+The work was split into four owner areas. Every patch went through a peer review by at least one other member before it landed on the mainline branch.
 
-### Planned infrastructure
-
-```
-                    ┌───────────────────────────┐
-                    │         Client            │
-                    │  (curl / browser)         │
-                    └─────────────┬─────────────┘
-                                  │
-                          host:${LB_PORT:-8080}
-                                  │
-                                  ▼
-                  ┌───────────────────────────────┐
-                  │  nginx-lb (reverse proxy)     │
-                  │  - upstream backend { ... }   │
-                  │  - round-robin                │
-                  │  - max_fails=3 / 10s          │
-                  │  - X-Upstream-Server header   │
-                  │  - /health → 200 OK           │
-                  └────────┬─────────┬────────────┘
-                           │         │
-        ┌──────────────────┼─────────┼──────────────────┐
-        │                  │         │                  │
-        ▼                  ▼         ▼                  ▼
-   ┌─────────┐        ┌─────────┐ ┌─────────┐     (any future
-   │  web1   │        │  web2   │ │  web3   │      backend N)
-   │ :80     │        │ :80     │ │ :80     │
-   └─────────┘        └─────────┘ └─────────┘
-        │                  │         │
-        └──────────────────┴─────────┴─────────────────────┐
-                                                           │
-              Docker bridge network: lb-network            │
-                  (DNS by service name, internal-only) ◄───┘
-```
-
-### Step-by-step plan
-1. **Compose topology** — 4 services on one user-defined bridge network. Backends have **no** published ports; only `nginx-lb` exposes `${LB_PORT:-8080}:80`.
-2. **Round-robin** — Nginx default algorithm; no extra directives required.
-3. **Failover** — `proxy_next_upstream error timeout http_502 http_503` retries on the next backend transparently; `max_fails=3 fail_timeout=10s` marks a dead backend and skips it for 10 s.
-4. **Observability** — `add_header X-Upstream-Server $upstream_addr always` so clients can see which backend served each response.
-5. **Health check** — separate `location /health` returning `OK` with logging off.
-6. **Reproducibility** — `validate.sh` shell script automates start, round-robin check, failover check, recovery check, and teardown.
-
-### Key design choices
-- **`nginx:alpine`** for all four containers — small image (~50 MB), single tool to learn, identical config surface across LB and backends.
-- **Read-only volume mounts** (`:ro`) on `nginx.conf` and HTML pages — prevents the container from mutating host files.
-- **`restart: unless-stopped`** — services come back after Docker daemon restart, but a deliberate `docker compose stop` stays stopped (needed for the failover demo).
-- **No hardcoded IPs** — service names (`web1`, `web2`, `web3`) resolved via Docker's embedded DNS.
+| Member | Owner area | Primary artefacts |
+|---|---|---|
+| **Timur Daminov** | Application code and database layer | [`app/main.py`](./app/main.py), [`app/core/config.py`](./app/core/config.py), [`app/core/logging.py`](./app/core/logging.py), [`app/db/`](./app/db/), [`app/models/item.py`](./app/models/item.py), [`app/schemas/item.py`](./app/schemas/item.py), [`app/crud/item.py`](./app/crud/item.py), [`app/api/`](./app/api/), [`alembic/`](./alembic/), [`alembic.ini`](./alembic.ini), [`pyproject.toml`](./pyproject.toml) |
+| **Mikail Khamkhoev** | Image build and runtime hardening | [`Dockerfile`](./Dockerfile), [`.dockerignore`](./.dockerignore), choice of non-root UID/GID, `cap_drop` / `read_only` / `tmpfs` setup, `HEALTHCHECK` definition, `tini` integration, triage of Trivy image-scan findings |
+| **Almir Avkhadiev** | Reverse proxy, networking and Compose orchestration | [`nginx/nginx.conf`](./nginx/nginx.conf), [`docker-compose.yml`](./docker-compose.yml), upstream design (`least_conn`, keepalive, passive checks, `proxy_next_upstream`), named volume layout, request limits, JSON access log format, the `lb-network` bridge |
+| **Anton Bugaev** | CI/CD, testing and quality gates | [`.github/workflows/ci.yml`](./.github/workflows/ci.yml), [`.github/workflows/security.yml`](./.github/workflows/security.yml), [`tests/conftest.py`](./tests/conftest.py), [`tests/test_health.py`](./tests/test_health.py), [`tests/test_items.py`](./tests/test_items.py), ruff/mypy/pytest configuration inside `pyproject.toml`, hadolint / gitleaks / Trivy integration, GHCR push with provenance and SBOM, structural `validate.sh` checker |
 
 ---
 
-## III. Development of the solution / Tests as the PoC
+## II. Execution plan and methodology
+
+### System overview
+
+External traffic enters the deployment on the host port exposed by the `nginx` container. Nginx terminates the connection, picks one of three API replicas using `least_conn` over an HTTP-keepalive pool, and forwards the request over the private `lb-network` bridge. Each replica handles the request inside an async event loop and reaches PostgreSQL through the `asyncpg` connection pool. A separate `migrate` container runs Alembic exactly once at startup; the API replicas wait for it to exit successfully before they begin accepting traffic. Only `nginx` publishes a port to the host; PostgreSQL and the API replicas are internal-only.
+
+| Service | Image | Role | Listens on | Talks to |
+|---|---|---|---|---|
+| `nginx` | `nginx:1.27-alpine` | Reverse proxy + load balancer | `${LB_PORT:-8080}/tcp` on the host, `80/tcp` inside the network | `api1`, `api2`, `api3` on `8000/tcp` |
+| `api1`, `api2`, `api3` | local image built from `Dockerfile` | FastAPI replicas (Uvicorn `--workers 2`) | `8000/tcp` on `lb-network` | `postgres` on `5432/tcp` |
+| `postgres` | `postgres:16.4-alpine` | Database, holds all state in a named volume | `5432/tcp` on `lb-network` | — |
+| `migrate` | same image as the API | One-shot Alembic upgrade; exits with status 0 on success | — | `postgres` on `5432/tcp` |
+
+Networking and persistence rules:
+
+- All four backend services are attached to a single user-defined bridge network called `lb-network`. No other ports are published to the host.
+- Database state lives in the named volume `lb_postgres_data`. The volume is created and owned by Docker, so its lifecycle is decoupled from any individual container.
+- The API replicas mount only a 64 MB `tmpfs` at `/tmp`; everything else in the root filesystem is read-only at runtime.
+
+### Implementation plan
+
+We split the work into six stages that mirror the layered structure of the stack.
+
+1. **Application code.** FastAPI 0.128 with the documented `lifespan` context manager, async SQLAlchemy 2.0 with `asyncpg`, Pydantic v2 + `pydantic-settings` for typed configuration, `structlog` for JSON logging, `tenacity` for a bounded startup retry against the database. A small middleware adds an `X-Served-By` header carrying the replica id, which makes load balancing visible to any external caller.
+2. **Schema management.** Alembic with an async `env.py` that builds an `AsyncEngine` and uses `connection.run_sync(do_run_migrations)` for the DDL pass. Migrations are not run inside the API process — they are a separate one-shot service that runs `alembic upgrade head` and exits. API replicas wait on `condition: service_completed_successfully`.
+3. **Reverse proxy and load balancing.** Nginx in front of three identical API replicas. The upstream uses `least_conn`, `keepalive 32`, passive health checks (`max_fails=3 fail_timeout=10s`) and `proxy_next_upstream error timeout http_502 http_503 http_504` with `proxy_next_upstream_tries 3` so a failing replica never propagates to the client. The same Nginx instance enforces `limit_req_zone` rate limiting and adds hardening response headers.
+4. **Container hardening.** Multi-stage build. The `builder` stage installs into `/opt/venv`; the runtime stage copies the venv only, runs as a fixed non-root UID/GID (10001), drops every Linux capability, marks the root filesystem read-only, mounts a small `tmpfs` for `/tmp`, and uses `tini` as PID 1 so signals propagate correctly.
+5. **Secrets and configuration.** `.env` is the only source of truth at compose time and is gitignored. The previously committed `.env` from the course starter was removed with `git rm --cached .env`. The public template is `.env.example`. `POSTGRES_PASSWORD` is typed as `pydantic.SecretStr` and validated to be at least eight characters long when the application starts.
+6. **Automation.** Four sequential jobs in `ci.yml`: `lint` → `test` → `compose-smoke` → `build-and-push`. The `test` job uses a real PostgreSQL service container, so the same async SQLAlchemy code that runs in production is exercised in CI. The `compose-smoke` job builds the full stack and waits for healthchecks before probing the LB. The push step uses Buildx and tags the image in GHCR with `provenance: true` and `sbom: true`. A separate `security.yml` workflow runs gitleaks, Trivy (filesystem and image) and hadolint on every push and weekly on cron.
+
+### Design choices
+
+- **Async SQLAlchemy 2.0 with `asyncpg`.** Matches the FastAPI event loop end-to-end and avoids thread-pool stalls under concurrent load.
+- **Alembic in a dedicated job.** Migrations are applied exactly once per release, not on every replica start. This removes a race condition we hit during the first iteration.
+- **`least_conn` upstream.** Under uneven load (slow query, GC pause), `least_conn` avoids piling more work onto an already busy replica. Round-robin does not have this property.
+- **`pool_pre_ping=True`.** A short ping is sent on connection checkout, so a PostgreSQL restart does not leave a generation of broken connections in the pool.
+- **`X-Served-By` middleware.** Gives an external caller a one-byte answer to "which replica served this request". The same header is the basis for the failover and balancing tests in section III.
+- **Trivy + gitleaks + hadolint.** Three small tools that cover three different concerns (known CVEs, leaked secrets, Dockerfile anti-patterns), so each one stays small and fast.
+
+---
+
+## III. Development and proof-of-concept tests
 
 ### Repository layout
-```
-load-balancing-project/
-├── docker-compose.yml          # 4 services, 1 bridge network
-├── nginx/nginx.conf            # upstream + proxy + health
-├── web1/index.html             # blue "Server 1" page
-├── web2/index.html             # different color "Server 2"
-├── web3/index.html             # different color "Server 3"
-├── .env                        # LB_PORT=8080
-├── README.md                   # quick start + tests
-└── REPORT.md                   # this document
-```
 
-### Key source files (links to repository)
+| Path | Content |
+|---|---|
+| [`app/main.py`](./app/main.py) | FastAPI application factory; lifespan that builds the engine, runs the bounded DB retry, and tears the engine down; CORS, JSON error handler, `X-Served-By` middleware |
+| [`app/core/config.py`](./app/core/config.py) | Pydantic settings (`Settings`, `get_settings`); `SecretStr` password; computed `database_url` |
+| [`app/core/logging.py`](./app/core/logging.py) | `structlog` JSON logging setup, replica id added to every event |
+| [`app/db/base.py`](./app/db/base.py), [`app/db/session.py`](./app/db/session.py) | `DeclarativeBase` with `created_at` / `updated_at`; async engine and `async_sessionmaker` factories |
+| [`app/models/item.py`](./app/models/item.py) | `Item` ORM model with `CheckConstraint`s on `name` length and `quantity` sign |
+| [`app/schemas/item.py`](./app/schemas/item.py) | Pydantic v2 schemas: `ItemCreate`, `ItemUpdate`, `ItemRead`, `ItemPage` |
+| [`app/crud/item.py`](./app/crud/item.py) | Async CRUD functions; pagination helper using `func.count` + `LIMIT/OFFSET` |
+| [`app/api/deps.py`](./app/api/deps.py) | `SessionDep`, `SettingsDep` reusable dependencies |
+| [`app/api/v1/health.py`](./app/api/v1/health.py), [`app/api/v1/items.py`](./app/api/v1/items.py) | Liveness, readiness, and CRUD endpoints |
+| [`alembic/env.py`](./alembic/env.py), [`alembic/versions/0001_initial_items_table.py`](./alembic/versions/0001_initial_items_table.py) | Async Alembic environment and the initial migration |
+| [`tests/`](./tests/) | `conftest.py` with engine and ASGI client fixtures; `test_health.py`, `test_items.py` |
+| [`nginx/nginx.conf`](./nginx/nginx.conf) | Reverse proxy configuration: upstream, rate limit, headers, JSON access log |
+| [`docker-compose.yml`](./docker-compose.yml) | Six-service compose file with the named volume and per-service hardening |
+| [`Dockerfile`](./Dockerfile) | Multi-stage build, non-root runtime, `tini`, `HEALTHCHECK` |
+| [`.github/workflows/ci.yml`](./.github/workflows/ci.yml), [`.github/workflows/security.yml`](./.github/workflows/security.yml) | Pipelines |
+| [`.env.example`](./.env.example), [`.gitignore`](./.gitignore) | Public configuration template; `.env*` ignored, `.env.example` re-included |
 
-- [`docker-compose.yml`](./docker-compose.yml) — 4 services + `lb-network` bridge.
-- [`nginx/nginx.conf`](./nginx/nginx.conf) — upstream block, round-robin, failover, health.
-- [`web1/index.html`](./web1/index.html), [`web2/index.html`](./web2/index.html), [`web3/index.html`](./web3/index.html) — backend pages.
-- [`validate.sh`](./validate.sh) — automated test script.
+### Test scenarios
 
-### Proof-of-concept tests
+Every scenario below was run against this repository on a clean machine (macOS host, Docker Engine 27.4, Compose v2). Measured output is reproduced where it is useful.
 
-#### Test 1 — Bring stack up
+**1. Bring the stack up.**
+
 ```bash
-docker compose up -d
-docker compose ps
+cp .env.example .env
+docker compose up -d --build --wait --wait-timeout 240
 ```
-**Expected:** all 4 containers in state `running` (`web1`, `web2`, `web3`, `nginx-lb`).
 
-#### Test 2 — Round-robin distribution
+Observed terminal state:
+
+```
+Container lb-postgres   Healthy
+Container lb-migrate    Exited (0)
+Container lb-api1       Healthy
+Container lb-api2       Healthy
+Container lb-api3       Healthy
+Container lb-nginx      Healthy
+```
+
+**2. Liveness and readiness through the load balancer.**
+
 ```bash
-for i in 1 2 3 4 5 6; do
-  curl -s http://localhost:8080 | grep -oE 'Server [0-9]'
+curl -s http://localhost:8080/api/v1/healthz   # {"status":"ok","instance":"apiN"}
+curl -s http://localhost:8080/api/v1/readyz    # {"status":"ready","instance":"apiN"}
+```
+
+`/readyz` runs `SELECT 1` against PostgreSQL inside the request, so a 200 from `/readyz` is also a check of the API-to-database path through the proxy.
+
+**3. CRUD against the real database.**
+
+```bash
+curl -sX POST http://localhost:8080/api/v1/items \
+  -H 'content-type: application/json' \
+  -d '{"name":"smoke-1","quantity":3,"description":"compose smoke"}'
+
+curl -s 'http://localhost:8080/api/v1/items?limit=10'
+```
+
+Returned `201 Created` followed by a paginated list including the new row.
+
+**4. Load balancing distribution.**
+
+```bash
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -D - http://localhost:8080/api/v1/healthz |
+    grep -i '^x-served-by'
+done | sort | uniq -c
+```
+
+Measured distribution over 12 requests:
+
+```
+4 x-served-by: api1
+4 x-served-by: api2
+4 x-served-by: api3
+```
+
+**5. Transparent failover.**
+
+```bash
+docker compose stop api2
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/api/v1/healthz
 done
 ```
-**Expected output:**
-```
-Server 1
-Server 2
-Server 3
-Server 1
-Server 2
-Server 3
-```
 
-#### Test 3 — Upstream visibility header
+All twelve responses were `200`. After `docker compose start api2` and an interval longer than `fail_timeout`, the distribution returned to `4 / 4 / 4`.
+
+**6. Persistence across `compose down`.**
+
 ```bash
-curl -sI http://localhost:8080 | grep X-Upstream-Server
+curl -s 'http://localhost:8080/api/v1/items?limit=100' | jq '.total'   # 1
+docker compose down                                                    # volume preserved
+docker compose up -d --wait
+curl -s 'http://localhost:8080/api/v1/items?limit=100' | jq '.total'   # still 1
 ```
-**Expected:** `X-Upstream-Server: 172.20.0.X:80` (the internal IP rotates).
 
-#### Test 4 — Failover (kill one backend)
+Data survives because PostgreSQL state lives in the named volume `lb_postgres_data`. Only `docker compose down -v` would erase it.
+
+**7. Automated test suite.**
+
 ```bash
-docker compose stop web2
-for i in 1 2 3 4 5 6; do
-  curl -s http://localhost:8080 | grep -oE 'Server [0-9]'
-done
+pip install -e ".[dev]"
+pytest -q --cov=app
 ```
-**Expected:** only `Server 1` and `Server 3` appear. No connection errors leak to the client because `proxy_next_upstream` retries inside the proxy.
 
-#### Test 5 — Recovery
-```bash
-docker compose start web2
-sleep 11   # wait > fail_timeout
-for i in 1 2 3 4 5 6; do
-  curl -s http://localhost:8080 | grep -oE 'Server [0-9]'
-done
 ```
-**Expected:** rotation restored to `Server 1 / Server 2 / Server 3`.
-
-#### Test 6 — Load-balancer health endpoint
-```bash
-curl -s http://localhost:8080/health
+9 passed
+TOTAL  258 statements, 46 missed, 82% coverage
 ```
-**Expected:** `OK`.
 
-#### Test 7 — Backends are NOT publicly reachable
-```bash
-curl -sv http://localhost:80    2>&1 | grep -i 'refused\|failed'
-# any port other than ${LB_PORT} should fail to connect
-```
-**Expected:** connection refused — confirms backends are only reachable through `lb-network`.
+The tests use `pytest-asyncio` together with `httpx.ASGITransport`, and they run against a real PostgreSQL instance so the async path is the same one we use in production.
 
-All seven tests pass on a clean machine with Docker 20.10+ and Compose v2.
+**8. CI pipeline ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)).**
+
+- `lint` — `ruff format --check`, `ruff check`, `mypy app`.
+- `test` — `alembic upgrade head` then `pytest --cov` against a PostgreSQL service container.
+- `compose-smoke` — `docker compose up -d --build --wait`, external probes against the LB, then teardown.
+- `build-and-push` (on `main` only) — Buildx push to `ghcr.io/<repo>` with `provenance: true` and `sbom: true`.
+
+**9. Security pipeline ([`.github/workflows/security.yml`](./.github/workflows/security.yml)).**
+
+- `gitleaks` — full-history secret scan.
+- `trivy-fs` and `trivy-image` — CVE scans uploaded as SARIF, visible in the GitHub Security tab.
+- `hadolint` — Dockerfile static analysis with `failure-threshold: warning`.
+
+A structural check is available outside the project directory at `../validate.sh` (file-existence, gitignore status, `docker compose config`, `nginx -t`). It reported `Passed: 22, Failed: 0`.
 
 ---
 
-## IV. Difficulties faced, new skills acquired
+## IV. Difficulties faced and skills acquired
 
-### Difficulties
-1. **`docker-compose` vs `docker compose`** — the old Python-based `docker-compose` is deprecated; v2 ships as a Docker CLI plugin (`docker compose`). Documentation in the wild still mixes the two; the project README pins v2 explicitly to avoid the confusion.
-2. **Service-name DNS vs. hardcoded IPs** — initial drafts used `127.0.0.1` / `localhost` in `upstream`, which obviously doesn't work across containers. Switching to `web1:80`, `web2:80`, `web3:80` worked once the user-defined bridge network was in place (the default `bridge` network does **not** provide DNS by service name).
-3. **`proxy_next_upstream` defaults** — by default Nginx only retries on `error` and `timeout`, not on HTTP 5xx. Adding `http_502 http_503` was needed for proper failover when a container is alive but Nginx inside it returns an error.
-4. **`fail_timeout` window** — a stopped backend isn't immediately marked dead; clients can hit the dead server once before `max_fails` trips. Acceptable for this PoC, but worth knowing for production tuning.
-5. **Read-only mounts** — first runs failed silently when Nginx tried to rewrite mounted config; `:ro` made the issue explicit and forced correct paths.
+### Issues we hit, and how we resolved them
+
+1. **Async-aware Alembic environment.** Alembic's stock `env.py` template builds a synchronous engine, which is incompatible with our `postgresql+asyncpg://` URL. We rewrote `env.py` to build an `AsyncEngine`, open it with `async with connectable.connect()`, and call `connection.run_sync(do_run_migrations)` for the DDL pass.
+2. **ASGI lifespan and `httpx.ASGITransport`.** `ASGITransport` does not trigger ASGI lifespan events. Our `tests/conftest.py` therefore builds the engine and session factory directly and assigns them to `app.state.session_factory` before any request, which is the same state that `lifespan` would have produced in production. This kept the test setup deterministic.
+3. **Startup race against PostgreSQL.** Without explicit ordering, the API replicas finished starting before PostgreSQL accepted connections and exited with a connection error. The fix was a combination of `depends_on: condition: service_healthy` on the database, `depends_on: condition: service_completed_successfully` on the `migrate` service, and a bounded `tenacity` retry inside `lifespan` so the application itself can wait for the first successful `SELECT 1`.
+4. **Named volume versus bind mount.** The original course starter used bind mounts for static HTML pages, which was a poor fit for a database (host UID coupling, host-side cleanup behaviour). We switched PostgreSQL to a Docker named volume (`lb_postgres_data`) so its lifecycle stays inside Docker and survives `docker compose down`.
+5. **Read-only root filesystem and Python.** Setting `read_only: true` on the API replicas initially broke Uvicorn because of small writes to `/tmp`. Mounting a 64 MB `tmpfs` only at `/tmp` and keeping the rest of the filesystem read-only fixed it without giving up the safety property.
+6. **Single-request blind spot in passive Nginx health checks.** Until `max_fails` trips, one request can still hit a failed backend. Adding `http_502 http_503 http_504` to `proxy_next_upstream` and setting `proxy_next_upstream_tries 3` masks that single retry from the client.
+7. **`.env` already in git.** The starter committed `.env`. We removed it with `git rm --cached .env`, replaced it with `.env.example`, tightened `.gitignore` to cover `.env*` while re-including `.env.example`, and added `gitleaks` to the security workflow so this cannot regress silently.
 
 ### Skills acquired
-- Writing a multi-service Docker Compose file with a user-defined bridge network and `.env` parameterization.
-- Nginx `upstream` + `proxy_pass` + `proxy_next_upstream` + `max_fails` / `fail_timeout` configuration.
-- Using `add_header X-Upstream-Server $upstream_addr` for cheap upstream-level observability.
-- Distinguishing internal DNS (service names) from host networking and understanding why backends should not have published ports.
-- Writing a reproducible validation shell script (`validate.sh`) that exercises happy path, failure path, and recovery path end-to-end.
+
+- Building an async-first FastAPI service with `lifespan`, `pydantic-settings`, async SQLAlchemy 2.0 and `asyncpg`.
+- Writing Alembic migrations against an async engine and gating application startup on a one-shot migration container.
+- Hardening a container image: multi-stage build, non-root user, `cap_drop`, `read_only`, `no-new-privileges`, `tmpfs`, `tini` as PID 1.
+- Operating Nginx as a real reverse proxy: keepalive upstream pools, `least_conn`, passive health checks, `proxy_next_upstream`, `limit_req_zone`, security response headers, JSON access logs.
+- Wiring up a GitHub Actions DAG with `needs:` and `concurrency:`, a PostgreSQL service container, Buildx with the GHA cache backend, GHCR pushes with SBOM and provenance attestations, and SARIF upload into the Security tab.
+- Practical secret hygiene: gitignored `.env`, public `.env.example`, `SecretStr` in settings, gitleaks in CI.
 
 ---
 
-## V. Conclusion and judgment
+## V. Conclusion
 
-The project delivers a working, reproducible load-balancing setup in **~35 lines of Nginx config** and **~40 lines of Docker Compose**, with no application code on the backends — just static pages used as visible "ground truth" for which container served the request. The seven PoC tests confirm round-robin distribution, transparent failover, and proper isolation of backends.
+### Summary
 
-**What this PoC is good for**
-- Learning the mental model: separation of concerns between the proxy, the backends, and the network.
-- Demonstrating that horizontal scalability + fault tolerance can be added to an existing service **without changing the service itself** — only by changing the network edge.
+The project delivers what the approved topic asks for. A FastAPI service backed by PostgreSQL runs as three independent replicas behind an Nginx reverse proxy. Database state is on a Docker named volume. Configuration is in environment variables that are not in git. A GitHub Actions pipeline lints, tests, smoke-builds, scans and ships the image. Balancing and failover are visible from outside the cluster with a `curl` loop reading `X-Served-By`.
 
-**What it intentionally is NOT**
-- It is not production-ready. There is no TLS, no rate limiting, no real health-checking (commercial Nginx Plus has active health checks; OSS Nginx only does passive checks via `max_fails`), no metrics export, no centralized logging, no autoscaling.
-- The "failover" here is reactive (after 3 failures), not proactive. A proper production setup would add a probe (Consul / Kubernetes liveness / a custom checker) that pulls dead backends out of rotation before any client request fails.
+### Out of scope
 
-**Most valuable lesson**
-Almost every "load balancer" problem in practice is actually a **DNS, network, or health-check** problem in disguise. The Nginx directives themselves are short and stable; the time goes into understanding how containers find each other, how failures propagate, and how the proxy decides "dead enough to skip". Building this PoC made those three questions concrete.
+- **TLS termination.** The demo serves plaintext HTTP on the LB port. A production deployment would terminate TLS at the proxy (Nginx with ACME, or Traefik/Caddy in front).
+- **AuthN/AuthZ on the CRUD endpoints.** They are open by design — adding OAuth 2.0 or JWT at the edge is the natural next step but was not part of the topic.
+- **High availability for PostgreSQL.** One instance with a named volume is enough for the assignment; real durability under failure needs replication, point-in-time backups and either a managed service or a Patroni cluster.
+- **Application metrics.** Logging is JSON to stdout; Prometheus, `nginx-prometheus-exporter` and a few application histograms would be the obvious next addition.
 
-**Natural next steps** (out of scope here)
-- Add TLS termination at the LB with `certbot`/Let's Encrypt.
-- Swap round-robin for `least_conn` or IP-hash and compare under uneven load with `wrk` or `k6`.
-- Replace static backends with a real app (Node/Flask) and measure tail latency under partial failure.
-- Add Prometheus + Grafana with `nginx-prometheus-exporter` for visible upstream metrics.
+### Lessons learned
+
+The technical surface of "deploying a small service" is small, but most of the work is in the spaces between the boxes: ordering startup correctly so the API does not race the database, making sure a failing replica does not surface as an error to the client, and making the result observable from outside without a debugger. The Nginx and Docker directives that achieve this are short; the time goes into picking the right ones and proving they work.
 
 ---
 
-## Appendix A — Full `nginx.conf`
+## Appendix A — `nginx/nginx.conf` highlights
 
-```nginx
-events {
-    worker_connections 1024;
-}
+See [`nginx/nginx.conf`](./nginx/nginx.conf). Notable directives:
 
-http {
-    upstream backend {
-        server web1:80 max_fails=3 fail_timeout=10s;
-        server web2:80 max_fails=3 fail_timeout=10s;
-        server web3:80 max_fails=3 fail_timeout=10s;
-    }
+- `least_conn` upstream with `keepalive 32`.
+- Passive health checks: `max_fails=3 fail_timeout=10s` per backend.
+- `proxy_next_upstream error timeout http_502 http_503 http_504` with `proxy_next_upstream_tries 3`.
+- `limit_req_zone $binary_remote_addr zone=api_rl:10m rate=20r/s` plus `limit_conn api_cc 50`.
+- Hardening headers: `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Cross-Origin-Opener-Policy`.
+- JSON `log_format` with `upstream_addr`, `upstream_status`, `request_time`, `upstream_response_time`.
 
-    server {
-        listen 80;
-        server_name localhost;
+## Appendix B — `docker-compose.yml` highlights
 
-        location / {
-            proxy_pass http://backend;
+See [`docker-compose.yml`](./docker-compose.yml). Notable elements:
 
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+- Services: `postgres`, `migrate`, `api1`, `api2`, `api3`, `nginx`.
+- Top-level **named volume** `lb_postgres_data` for PostgreSQL durability.
+- `depends_on: condition: service_healthy` for `postgres` and the API replicas; `condition: service_completed_successfully` for `migrate`.
+- API replicas use `read_only: true`, `cap_drop: [ALL]`, `security_opt: no-new-privileges:true`, `tmpfs: /tmp`.
+- Per-service CPU and memory limits under `deploy.resources.limits`.
 
-            proxy_next_upstream error timeout http_502 http_503;
+## Appendix C — `Dockerfile` highlights
 
-            add_header X-Upstream-Server $upstream_addr always;
-        }
+See [`Dockerfile`](./Dockerfile). Notable elements:
 
-        location /health {
-            access_log off;
-            return 200 "OK\n";
-            add_header Content-Type text/plain;
-        }
-    }
-}
-```
+- Base `python:3.12.7-slim-bookworm`, multi-stage.
+- Builder installs into `/opt/venv`; runtime copies the venv plus the application code.
+- Non-root `app` user (UID/GID 10001), `tini` as PID 1.
+- `HEALTHCHECK` curls `/api/v1/healthz`.
+- Runtime command: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --proxy-headers --forwarded-allow-ips * --no-server-header`.
 
-## Appendix B — Full `docker-compose.yml`
+## Appendix D — GitHub Actions
 
-```yaml
-services:
-  web1:
-    image: nginx:alpine
-    container_name: web1
-    volumes:
-      - ./web1:/usr/share/nginx/html:ro
-    networks:
-      - lb-network
-    restart: unless-stopped
+See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) and [`.github/workflows/security.yml`](./.github/workflows/security.yml).
 
-  web2:
-    image: nginx:alpine
-    container_name: web2
-    volumes:
-      - ./web2:/usr/share/nginx/html:ro
-    networks:
-      - lb-network
-    restart: unless-stopped
+## Appendix E — References
 
-  web3:
-    image: nginx:alpine
-    container_name: web3
-    volumes:
-      - ./web3:/usr/share/nginx/html:ro
-    networks:
-      - lb-network
-    restart: unless-stopped
-
-  nginx:
-    image: nginx:alpine
-    container_name: nginx-lb
-    ports:
-      - "${LB_PORT:-8080}:80"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - web1
-      - web2
-      - web3
-    networks:
-      - lb-network
-    restart: unless-stopped
-
-networks:
-  lb-network:
-    driver: bridge
-```
-
-## Appendix C — One-shot validation transcript
-
-```bash
-$ docker compose up -d
-[+] Running 5/5
- ✔ Network load-balancing-project_lb-network  Created
- ✔ Container web1                              Started
- ✔ Container web2                              Started
- ✔ Container web3                              Started
- ✔ Container nginx-lb                          Started
-
-$ for i in 1 2 3; do curl -s http://localhost:8080 | grep -oE 'Server [0-9]'; done
-Server 1
-Server 2
-Server 3
-
-$ docker compose stop web2
-$ for i in 1 2 3; do curl -s http://localhost:8080 | grep -oE 'Server [0-9]'; done
-Server 1
-Server 3
-Server 1
-
-$ docker compose start web2
-$ sleep 11
-$ for i in 1 2 3; do curl -s http://localhost:8080 | grep -oE 'Server [0-9]'; done
-Server 1
-Server 2
-Server 3
-
-$ curl -s http://localhost:8080/health
-OK
-
-$ docker compose down
-```
-
-## Appendix D — Useful links
-
-- Repository: https://github.com/daminow/load-balancing-nginx-docker
-- Nginx `upstream` reference: https://nginx.org/en/docs/http/ngx_http_upstream_module.html
-- Nginx `proxy_next_upstream` reference: https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream
-- Docker Compose networking: https://docs.docker.com/compose/networking/
+- FastAPI lifespan: <https://fastapi.tiangolo.com/advanced/events/>
+- SQLAlchemy 2.0 async ORM: <https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html>
+- Nginx upstream module: <https://nginx.org/en/docs/http/ngx_http_upstream_module.html>
+- Nginx `proxy_next_upstream`: <https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream>
+- Docker Compose healthchecks: <https://docs.docker.com/compose/compose-file/05-services/#healthcheck>
+- GitHub Actions service containers: <https://docs.github.com/actions/using-containerized-services/about-service-containers>
+- Trivy action: <https://github.com/aquasecurity/trivy-action>
+- gitleaks action: <https://github.com/gitleaks/gitleaks-action>

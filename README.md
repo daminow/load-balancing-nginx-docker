@@ -1,100 +1,152 @@
-# Load Balancing with Nginx and Docker
+# Automated Deployment of a Multi-Service Web Application with CI/CD
 
-A containerized load balancing setup using Nginx as a reverse proxy distributing traffic across three backend servers via Docker Compose.
+FastAPI + PostgreSQL behind an Nginx reverse proxy that load-balances three application replicas. Schema is applied by a one-shot Alembic job. GitHub Actions runs lint, type-check, tests against a real PostgreSQL service container, a Compose smoke build, plus security scans (Trivy, gitleaks, hadolint), and pushes a signed multi-arch image to GHCR.
+
+| Component | Image / version |
+|---|---|
+| API | FastAPI 0.128.0 on Python 3.12, Uvicorn `--workers 2`, replicas `api1` / `api2` / `api3` |
+| Database | `postgres:16.4-alpine`, named volume `lb_postgres_data` |
+| Reverse proxy | `nginx:1.27-alpine`, `least_conn`, passive checks, rate limiting, security headers |
+| Migrations | One-shot Alembic 1.14 container |
+| CI/CD | GitHub Actions — [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/workflows/security.yml`](.github/workflows/security.yml) |
 
 ## Prerequisites
 
-- Docker Engine 20.10+
-- Docker Compose v2 (the `docker compose` command, not the old `docker-compose`)
+- Docker Engine 20.10 or newer with Docker Compose v2 (`docker compose`).
+- Optional for hostside development: Python 3.12 and `pip`.
 
-## Quick Start
-
-```bash
-docker compose up -d
-```
-
-## Verify
+## Quick start
 
 ```bash
-docker compose ps
+cp .env.example .env
+# Set POSTGRES_PASSWORD to a real value before anything that is not local.
+docker compose up -d --build --wait
 ```
 
-All 4 containers should show status "running":
-- `web1`, `web2`, `web3` - backend servers
-- `nginx-lb` - the load balancer / reverse proxy
-
-## Testing Round-Robin
-
-Run the curl command multiple times and observe how responses rotate between the three backends:
+After every healthcheck turns green, the load balancer is on `http://localhost:${LB_PORT:-8080}`.
 
 ```bash
-curl http://localhost:8080
-curl http://localhost:8080
-curl http://localhost:8080
+curl -s http://localhost:8080/api/v1/healthz
+curl -s http://localhost:8080/api/v1/readyz
+curl -s 'http://localhost:8080/api/v1/items?limit=5'
 ```
 
-Each request returns a different page - Server 1, Server 2, Server 3 - in sequential order because Nginx uses round-robin distribution by default.
+## API
 
-## Checking Response Headers
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/` | Service banner (`name`, `instance`, `docs`) |
+| `GET` | `/docs` | Swagger UI |
+| `GET` | `/openapi.json` | OpenAPI schema |
+| `GET` | `/api/v1/healthz` | Liveness probe, returns the serving instance id |
+| `GET` | `/api/v1/readyz` | Readiness probe (executes `SELECT 1`) |
+| `GET` | `/api/v1/items?limit=N&offset=M` | Paginated list |
+| `POST` | `/api/v1/items` | Create |
+| `GET` | `/api/v1/items/{id}` | Read one |
+| `PATCH` | `/api/v1/items/{id}` | Partial update |
+| `DELETE` | `/api/v1/items/{id}` | Delete |
+
+Every response carries an `X-Served-By` header naming the upstream replica that handled the request.
+
+## Observe load balancing
 
 ```bash
-curl -I http://localhost:8080
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -D - http://localhost:8080/api/v1/healthz |
+    grep -i '^x-served-by'
+done | sort | uniq -c
 ```
 
-Look for the `X-Upstream-Server` header in the response. It shows the IP address and port of the backend container that handled the request (e.g., `172.20.0.2:80`). This is the internal Docker network address, not the service name.
+Sample run from this repo:
 
-## Failover Test
+```
+4 x-served-by: api1
+4 x-served-by: api2
+4 x-served-by: api3
+```
 
-Stop one of the backend servers and verify that traffic is rerouted to the remaining healthy ones:
+## Failover
 
 ```bash
-docker compose stop web2
+docker compose stop api2
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/api/v1/healthz
+done
+docker compose start api2
 ```
 
-Now run curl multiple times - only Server 1 and Server 3 will respond:
+All ten responses are `200`. `proxy_next_upstream` retries on a healthy replica before the client sees any error. After `fail_timeout` elapses, distribution rebalances.
+
+## Persistence
+
+PostgreSQL data lives in the named Docker volume `lb_postgres_data`.
 
 ```bash
-curl http://localhost:8080
-curl http://localhost:8080
-curl http://localhost:8080
+docker volume ls | grep lb_postgres_data
+docker compose down       # data preserved
+docker compose down -v    # data erased
 ```
 
-Bring the server back:
+## Migrations
+
+The `migrate` service runs `alembic upgrade head` once and exits. The API replicas wait on `condition: service_completed_successfully` before they start.
 
 ```bash
-docker compose start web2
+docker compose run --rm migrate alembic revision --autogenerate -m "your change"
+docker compose run --rm migrate alembic upgrade head
 ```
 
-Run curl again - all three servers respond in rotation:
+## CI/CD
+
+`.github/workflows/ci.yml`:
+
+1. `lint` — `ruff format --check`, `ruff check`, `mypy`.
+2. `test` — `alembic upgrade head` and `pytest` against a real PostgreSQL service container with coverage upload.
+3. `compose-smoke` — builds and waits on the whole stack, probes the LB end-to-end.
+4. `build-and-push` (on `main` only) — Buildx push to `ghcr.io/<repo>` with `provenance: true` and `sbom: true`.
+
+`.github/workflows/security.yml`:
+
+- `gitleaks` — full-history secret scan.
+- `trivy-fs`, `trivy-image` — CVE scans uploaded as SARIF into the GitHub Security tab.
+- `hadolint` — Dockerfile lint (`failure-threshold: warning`).
+
+## Hostside development without Docker
 
 ```bash
-curl http://localhost:8080
-curl http://localhost:8080
-curl http://localhost:8080
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
+export $(grep -v '^#' .env | xargs)
+alembic upgrade head
+uvicorn app.main:app --reload
 ```
 
-## Load Balancer Health Check
+## Tests
 
 ```bash
-curl http://localhost:8080/health
+pip install -e ".[dev]"
+pytest -q --cov=app
 ```
 
-Returns `OK` if the load balancer itself is running.
+Tests run against a real PostgreSQL instance. Start one locally with `docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres-test-pwd -e POSTGRES_DB=appdb_test postgres:16.4-alpine`, or rely on the service container in CI.
 
-## Stop Everything
+## Secrets
 
-```bash
-docker compose down
-```
+- `.env` is never committed: `.gitignore` covers `.env*` and explicitly re-includes `.env.example`.
+- `POSTGRES_PASSWORD` is bound to `pydantic.SecretStr` and validated to be at least eight characters at startup.
+- Use Docker secrets or an external KMS in production. A plaintext `.env` is fine for local and CI only.
 
-## Architecture
+## Project layout
 
-Client requests hit the Nginx reverse proxy on port 8080 (configurable via `.env`). Nginx distributes these requests across three backend Nginx containers (`web1`, `web2`, `web3`) using round-robin load balancing. All containers run on an internal Docker bridge network (`lb-network`). Backend servers are not exposed to the host - they are only accessible through the proxy.
-
-## How It Works
-
-Docker Compose creates an isolated bridge network where all four containers can communicate. Containers resolve each other by service name (e.g., `web1`, `web2`, `web3`) through Docker's built-in DNS server - no IP addresses need to be hardcoded.
-
-Nginx is configured with an `upstream` block that lists all three backends. When a request arrives, Nginx forwards it to the next server in the list using the default round-robin algorithm. Each backend serves a distinct HTML page so you can visually confirm which server handled each request.
-
-If a backend fails, the `proxy_next_upstream` directive tells Nginx to retry the request on the next healthy server instead of returning an error to the client. The `max_fails` and `fail_timeout` parameters mark a backend as unavailable after 3 consecutive failures, skipping it for 10 seconds before trying again.
+| Path | Purpose |
+|---|---|
+| `app/` | FastAPI application (config, db, models, schemas, crud, api) |
+| `alembic/` | Async Alembic environment and initial migration |
+| `tests/` | pytest-asyncio + httpx ASGI transport |
+| `nginx/nginx.conf` | Reverse proxy with rate limit and security headers |
+| `docker-compose.yml` | postgres + migrate + api1/2/3 + nginx + named volumes |
+| `Dockerfile` | Multi-stage, non-root, tini as PID 1 |
+| `.github/workflows/` | `ci.yml` and `security.yml` |
+| `pyproject.toml` | Pinned dependencies and ruff/mypy/pytest configuration |
+| `.env.example` | Public template |
+| `.gitignore` | Real `.env` ignored, `.env.example` tracked |
