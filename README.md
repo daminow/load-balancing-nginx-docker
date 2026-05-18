@@ -1,4 +1,4 @@
-# Automated Deployment of a Multi-Service Web Application with CI/CD
+# Automated Deployment of a Multi-Service Web Application
 
 FastAPI + PostgreSQL behind an Nginx reverse proxy that load-balances three application replicas. Schema is applied by a one-shot Alembic job. GitHub Actions runs lint, type-check, tests against a real PostgreSQL service container, a Compose smoke build, plus security scans (Trivy, gitleaks, hadolint), and pushes a signed multi-arch image to GHCR.
 
@@ -19,7 +19,6 @@ FastAPI + PostgreSQL behind an Nginx reverse proxy that load-balances three appl
 
 ```bash
 cp .env.example .env
-# Set POSTGRES_PASSWORD to a real value before anything that is not local.
 docker compose up -d --build --wait
 ```
 
@@ -57,7 +56,7 @@ for i in $(seq 1 12); do
 done | sort | uniq -c
 ```
 
-Sample run from this repo:
+Sample run:
 
 ```
 4 x-served-by: api1
@@ -77,16 +76,6 @@ docker compose start api2
 
 All ten responses are `200`. `proxy_next_upstream` retries on a healthy replica before the client sees any error. After `fail_timeout` elapses, distribution rebalances.
 
-## Persistence
-
-PostgreSQL data lives in the named Docker volume `lb_postgres_data`.
-
-```bash
-docker volume ls | grep lb_postgres_data
-docker compose down       # data preserved
-docker compose down -v    # data erased
-```
-
 ## Migrations
 
 The `migrate` service runs `alembic upgrade head` once and exits. The API replicas wait on `condition: service_completed_successfully` before they start.
@@ -94,6 +83,13 @@ The `migrate` service runs `alembic upgrade head` once and exits. The API replic
 ```bash
 docker compose run --rm migrate alembic revision --autogenerate -m "your change"
 docker compose run --rm migrate alembic upgrade head
+```
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest -q --cov=app
 ```
 
 ## CI/CD
@@ -111,30 +107,8 @@ docker compose run --rm migrate alembic upgrade head
 - `trivy-fs`, `trivy-image` — CVE scans uploaded as SARIF into the GitHub Security tab.
 - `hadolint` — Dockerfile lint (`failure-threshold: warning`).
 
-## Hostside development without Docker
-
-```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
-export $(grep -v '^#' .env | xargs)
-alembic upgrade head
-uvicorn app.main:app --reload
-```
-
-## Tests
-
-```bash
-pip install -e ".[dev]"
-pytest -q --cov=app
-```
 
 Tests run against a real PostgreSQL instance. Start one locally with `docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=postgres-test-pwd -e POSTGRES_DB=appdb_test postgres:16.4-alpine`, or rely on the service container in CI.
-
-## Secrets
-
-- `.env` is never committed: `.gitignore` covers `.env*` and explicitly re-includes `.env.example`.
-- `POSTGRES_PASSWORD` is bound to `pydantic.SecretStr` and validated to be at least eight characters at startup.
-- Use Docker secrets or an external KMS in production. A plaintext `.env` is fine for local and CI only.
 
 ## Project layout
 
