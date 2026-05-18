@@ -17,6 +17,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
+  PIP_VERSION: "24.3.1"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -34,7 +35,7 @@ jobs:
 
       - name: Install project (dev extras)
         run: |
-          python -m pip install --upgrade pip==24.3.1
+          python -m pip install --upgrade "pip==${PIP_VERSION}"
           pip install -e ".[dev]"
 
       - name: Ruff format check
@@ -54,24 +55,24 @@ jobs:
       postgres:
         image: postgres:16.4-alpine
         env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres-test-pwd
-          POSTGRES_DB: appdb_test
+          POSTGRES_USER: ${{ vars.CI_POSTGRES_USER || 'postgres' }}
+          POSTGRES_PASSWORD: ${{ secrets.CI_POSTGRES_PASSWORD || format('pg-{0}', github.run_id) }}
+          POSTGRES_DB: ${{ vars.CI_POSTGRES_DB || 'appdb_test' }}
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d appdb_test"
+          --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
     env:
       APP_ENV: test
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres-test-pwd
-      POSTGRES_DB: appdb_test
+      POSTGRES_USER: ${{ vars.CI_POSTGRES_USER || 'postgres' }}
+      POSTGRES_PASSWORD: ${{ secrets.CI_POSTGRES_PASSWORD || format('pg-{0}', github.run_id) }}
+      POSTGRES_DB: ${{ vars.CI_POSTGRES_DB || 'appdb_test' }}
       POSTGRES_HOST: localhost
       POSTGRES_PORT: "5432"
-      INSTANCE_ID: ci-test
+      INSTANCE_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
 
@@ -82,7 +83,7 @@ jobs:
 
       - name: Install project (dev extras)
         run: |
-          python -m pip install --upgrade pip==24.3.1
+          python -m pip install --upgrade "pip==${PIP_VERSION}"
           pip install -e ".[dev]"
 
       - name: Apply Alembic migrations
@@ -103,22 +104,30 @@ jobs:
     name: Docker Compose smoke test
     runs-on: ubuntu-24.04
     needs: test
+    env:
+      POSTGRES_USER: ${{ vars.CI_POSTGRES_USER || 'postgres' }}
+      POSTGRES_PASSWORD: ${{ secrets.CI_POSTGRES_PASSWORD || format('smoke-{0}', github.run_id) }}
+      POSTGRES_DB: ${{ vars.CI_POSTGRES_DB || 'appdb' }}
+      LB_PORT: "8080"
+      APP_ENV: production
+      LOG_LEVEL: INFO
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Prepare .env for compose
+      - name: Render .env from job env
         run: |
-          cat > .env <<'EOF'
-          POSTGRES_USER=postgres
-          POSTGRES_PASSWORD=ci-only-pwd-12345
-          POSTGRES_DB=appdb
-          LB_PORT=8080
-          APP_ENV=production
-          LOG_LEVEL=INFO
-          EOF
+          umask 077
+          {
+            echo "POSTGRES_USER=${POSTGRES_USER}"
+            echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}"
+            echo "POSTGRES_DB=${POSTGRES_DB}"
+            echo "LB_PORT=${LB_PORT}"
+            echo "APP_ENV=${APP_ENV}"
+            echo "LOG_LEVEL=${LOG_LEVEL}"
+          } > .env
 
       - name: Build and start stack
         run: docker compose up -d --build --wait --wait-timeout 180
@@ -126,21 +135,24 @@ jobs:
       - name: Probe load balancer
         run: |
           set -euxo pipefail
-          curl --fail --silent http://localhost:8080/api/v1/healthz
-          curl --fail --silent http://localhost:8080/api/v1/readyz
+          curl --fail --silent "http://localhost:${LB_PORT}/api/v1/healthz"
+          curl --fail --silent "http://localhost:${LB_PORT}/api/v1/readyz"
 
           for _ in $(seq 1 12); do
-            curl -s -o /dev/null -w "%{http_code} %header{x-served-by}\n" \
-              http://localhost:8080/api/v1/healthz
+            curl -s -o /dev/null \
+              -w '%{http_code} %header{x-served-by}\n' \
+              "http://localhost:${LB_PORT}/api/v1/healthz"
           done | sort | uniq -c
 
       - name: CRUD smoke
         run: |
           set -euxo pipefail
-          curl -s -X POST http://localhost:8080/api/v1/items \
+          payload="$(printf '{"name":"smoke-%s","quantity":1}' "${GITHUB_RUN_ID}")"
+          curl --fail --silent -X POST \
+            "http://localhost:${LB_PORT}/api/v1/items" \
             -H 'content-type: application/json' \
-            -d '{"name":"ci-item","quantity":3}'
-          curl -s http://localhost:8080/api/v1/items?limit=10
+            -d "${payload}"
+          curl --fail --silent "http://localhost:${LB_PORT}/api/v1/items?limit=5"
 
       - name: Dump logs on failure
         if: failure()
